@@ -20,7 +20,7 @@ TIMEOUT = 30
 CHUNK_SIZE = 8192  # 下载时的块大小
 
 # HTTP配置
-USER_AGENT = 'NAME'
+USER_AGENT = 'NAME' #你的github用户名
 GITHUB_API_VERSION = 'application/vnd.github.v3+json'
 
 # 代理配置
