@@ -8,6 +8,10 @@ REPOS = [
     "bepass-org/warp-plus"
 ]
 
+# 版本管理配置
+CLEAN_OLD_VERSIONS = True  # 是否自动清理旧版本
+KEEP_VERSIONS_COUNT = 1    # 保留最近几个版本（当 CLEAN_OLD_VERSIONS 为 True 时生效）
+
 # 日志配置
 LOG_FILE = 'github_monitor.log'
 LOG_LEVEL = 'INFO'
