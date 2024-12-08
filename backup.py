@@ -30,6 +30,10 @@ class FileSystemError(GitHubBackupError):
     """文件系统相关错误"""
     pass
 
+class SecurityError(GitHubBackupError):
+    """安全相关错误"""
+    pass
+
 # 配置日志
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -118,25 +122,62 @@ class GitHubBackup:
     def safe_remove_dir(self, dir_path):
         """安全地删除目录及其内容"""
         try:
-            if os.path.exists(dir_path):
-                # 首先尝试直接删除
+            # 规范化路径
+            dir_path = os.path.abspath(dir_path)
+            downloads_path = os.path.abspath(DOWNLOAD_DIR)
+            
+            # 安全检查：确保要删除的目录在 downloads 目录下
+            if not dir_path.startswith(downloads_path):
+                raise SecurityError(f"安全限制：不能删除 {DOWNLOAD_DIR} 目录之外的文件")
+                
+            if not os.path.exists(dir_path):
+                logger.warning(f"要删除的目录不存在: {dir_path}")
+                return
+                
+            # 检查目录是否可访问
+            try:
+                os.listdir(dir_path)
+            except PermissionError:
+                logger.error(f"没有权限访问目录: {dir_path}")
+                return
+                
+            # 尝试删除
+            try:
+                shutil.rmtree(dir_path)
+                logger.info(f"成功删除目录: {dir_path}")
+                return
+            except PermissionError:
+                # 处理只读文件
                 try:
-                    shutil.rmtree(dir_path)
-                except PermissionError:
-                    # 如果失败，使用onerror处理器重试
                     shutil.rmtree(dir_path, onerror=self.remove_readonly)
+                    logger.info(f"成功删除只读目录: {dir_path}")
+                    return
                 except Exception as e:
-                    logger.error(f"删除目录失败 {dir_path}: {str(e)}")
-                    # 如果还是失败，尝试使用系统命令强制删除
-                    try:
-                        if os.name == 'nt':  # Windows
-                            subprocess.run(['cmd', '/c', 'rd', '/s', '/q', dir_path], check=False)
-                        else:  # Linux/Unix
-                            subprocess.run(['rm', '-rf', dir_path], check=False)
-                    except Exception as e:
-                        logger.error(f"强制删除目录失败 {dir_path}: {str(e)}")
+                    logger.error(f"删除只读目录失败: {str(e)}")
+                    
+            # 如果上述方法都失败，尝试使用系统命令
+            try:
+                if os.name == 'nt':  # Windows
+                    result = subprocess.run(['cmd', '/c', 'rd', '/s', '/q', dir_path], 
+                                         capture_output=True, 
+                                         text=True, 
+                                         check=False)
+                    if result.returncode != 0:
+                        logger.error(f"系统命令删除失败: {result.stderr}")
+                else:  # Linux/Unix
+                    result = subprocess.run(['rm', '-rf', dir_path], 
+                                         capture_output=True, 
+                                         text=True, 
+                                         check=False)
+                    if result.returncode != 0:
+                        logger.error(f"系统命令删除失败: {result.stderr}")
+            except Exception as e:
+                logger.error(f"系统命令执行失败: {str(e)}")
+                raise
+                
         except Exception as e:
-            logger.error(f"处理目录删除时发生错误 {dir_path}: {str(e)}")
+            logger.error(f"删除目录时发生错误 {dir_path}: {str(e)}")
+            raise
 
     def download_file_with_progress(self, url, local_filename, headers):
         """带进度条的文件下载"""
@@ -182,6 +223,75 @@ class GitHubBackup:
         except Exception as e:
             logger.error(f"保存版本信息失败 {repo}: {str(e)}")
 
+    def clean_old_versions(self, repo):
+        """清理旧版本的文件夹"""
+        # 如果配置为不清理旧版本，直接返回
+        if not CLEAN_OLD_VERSIONS:
+            logger.info(f"CLEAN_OLD_VERSIONS 设置为 False，跳过清理旧版本")
+            return
+
+        try:
+            repo_name = repo.split('/')[-1]
+            repo_dir = os.path.join(DOWNLOAD_DIR, repo_name)
+            
+            # 如果仓库目录不存在，直接返回
+            if not os.path.exists(repo_dir):
+                logger.warning(f"仓库目录不存在: {repo_dir}")
+                return
+            
+            # 读取当前版本
+            current_version = self.get_local_version(repo)
+            if not current_version:
+                logger.warning(f"无法获取仓库 {repo} 的当前版本信息")
+                return
+
+            logger.info(f"开始检查 {repo} 的旧版本，当前版本: {current_version}")
+            logger.info(f"配置保留最近 {KEEP_VERSIONS_COUNT} 个版本")
+
+            # 获取所有版本目录
+            version_dirs = []
+            for item in os.listdir(repo_dir):
+                item_path = os.path.join(repo_dir, item)
+                if os.path.isdir(item_path):
+                    # 记录目录创建时间和路径
+                    try:
+                        mtime = os.path.getmtime(item_path)
+                        version_dirs.append((mtime, item, item_path))
+                        logger.debug(f"找到版本目录: {item}, 修改时间: {datetime.fromtimestamp(mtime)}")
+                    except Exception as e:
+                        logger.error(f"获取目录信息失败 {item_path}: {str(e)}")
+
+            # 如果目录数量小于等于保留数量，不需要删除
+            if len(version_dirs) <= KEEP_VERSIONS_COUNT:
+                logger.info(f"当前版本数 ({len(version_dirs)}) 小于等于保留数量 ({KEEP_VERSIONS_COUNT})，无需清理")
+                return
+
+            # 按修改时间排序，最新的在前面
+            version_dirs.sort(reverse=True)
+            logger.info(f"找到 {len(version_dirs)} 个版本目录，将删除最旧的 {len(version_dirs) - KEEP_VERSIONS_COUNT} 个版本")
+
+            # 保留最新的版本
+            keep_versions = version_dirs[:KEEP_VERSIONS_COUNT]
+            delete_versions = version_dirs[KEEP_VERSIONS_COUNT:]
+
+            # 记录要保留的版本
+            for _, name, path in keep_versions:
+                logger.info(f"保留版本目录: {name}")
+
+            # 删除旧版本
+            for _, name, dir_path in delete_versions:
+                logger.info(f"正在删除旧版本目录: {name}")
+                try:
+                    self.safe_remove_dir(dir_path)
+                    logger.info(f"成功删除旧版本目录: {name}")
+                except Exception as e:
+                    logger.error(f"删除旧版本目录失败 {dir_path}: {str(e)}")
+
+            logger.info(f"完成 {repo} 的旧版本清理")
+
+        except Exception as e:
+            logger.error(f"清理旧版本时发生错误 {repo}: {str(e)}")
+
     def download_source_code(self, repo, folder):
         """直接下载仓库源代码ZIP文件"""
         # 获取最新release版本
@@ -196,14 +306,20 @@ class GitHubBackup:
             local_version = self.get_local_version(repo)
             if local_version == tag_name:
                 logger.info(f"仓库 {repo} 已是最新版本 {tag_name}，无需下载")
+                # 即使是最新版本，也执行一次清理检查
+                self.clean_old_versions(repo)
                 return True
                 
             version_folder = os.path.join(folder, repo_name, safe_tag_name)
             
             # 如果版本文件夹已存在，删除它
             if os.path.exists(version_folder):
-                logger.info(f"删除旧版本文件夹: {version_folder}")
-                self.safe_remove_dir(version_folder)
+                logger.info(f"发现已存在的版本文件夹: {version_folder}")
+                try:
+                    self.safe_remove_dir(version_folder)
+                except Exception as e:
+                    logger.error(f"删除旧版本失败，跳过下载: {str(e)}")
+                    return False
             
             # 创建新的版本文件夹
             os.makedirs(version_folder, exist_ok=True)
@@ -231,6 +347,10 @@ class GitHubBackup:
                     
                     # 保存新版本信息
                     self.save_local_version(repo, tag_name)
+                    
+                    # 清理旧版本
+                    self.clean_old_versions(repo)
+                    
                     return True
                 
             except Exception as e:
